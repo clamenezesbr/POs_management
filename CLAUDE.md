@@ -68,6 +68,24 @@ Campos mapeados: Project Name, DR No, Submitted Partner, Submitted by,
 Submited Date (typo do sistema, um "t"), Approval Date, Estimated Order Date,
 Estimated Amount, Approver, Expired Date, Public Tender, Project Background.
 
+## ⚠️ Bugs já corrigidos (para não regredir)
+
+### Timing: `networkidle` + grid wait
+**Sintoma:** status todos `None`, 0 POs encontradas mesmo com resultados visíveis no Chrome.
+**Causa:** `networkidle` dispara quando a XHR termina, mas o Vue ainda não pintou o DOM.
+**Correção aplicada:** `networkidle` como âncora principal + `wait_for(grid, visible, timeout=10s)`
+com `try/except` — porque quando há 0 resultados o Vue **não renderiza o grid**, e esperar
+por ele causaria timeout. O `except` silencia esse caso; `contar_linhas()` retorna 0 normalmente.
+
+### `filtrar_approved` e `ler_status` não achavam o card correto
+**Sintoma:** status todos `None` + `RuntimeError: Card 'Approved' nao encontrado`.
+**Causa raiz:** o número de contagem ("7") e o rótulo ("Approved") estão em níveis
+diferentes do DOM (ex: `card > div.count + div.label-wrapper > span.label`).
+Checar apenas os filhos diretos do pai do rótulo não encontrava o número.
+**Correção aplicada:** subir até 4 níveis a partir do rótulo via XPath +
+loop de ancestrais, procurando um filho direto com texto puramente numérico.
+Estratégia independente de nesting — funciona para qualquer estrutura de card.
+
 ## ⚠️ Risco conhecido: ID dinâmico do container
 `#aui-collapse-content-54912283` — o número `54912283` pode ser gerado
 dinamicamente pelo Vue e **mudar entre sessões ou deploys do site**.

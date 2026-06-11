@@ -79,6 +79,11 @@ def buscar_parceiro(page, nome_parceiro: str):
 
     page.get_by_role("button", name="Query").click()
     page.wait_for_load_state("networkidle")
+    # Tenta aguardar o grid, mas nao falha se nao houver resultados (Vue nao renderiza grid vazio)
+    try:
+        page.locator('[role="grid"]').wait_for(state='visible', timeout=10000)
+    except Exception:
+        pass
     print("[1] Busca concluida.")
 
 
@@ -91,18 +96,34 @@ STATUS_LABELS = ["Approving", "Approved", "Rejected", "Closed-Won",
 
 def ler_status(page) -> dict:
     """
-    Le os cards do topo. O numero fica no irmao anterior ao rotulo (confirmado
-    pelo agente). Fazemos via JS no contexto da pagina, mais confiavel que
-    adivinhar a hierarquia de divs.
+    Le os cards do topo. Sobe ate 4 niveis a partir do rotulo para achar
+    um ancestral cujo filho direto seja um numero puro — robusto a qualquer
+    nivel de nesting (count pode estar em div.top, enquanto label esta em div.bottom).
     """
     js = """(labels) => {
         const out = {};
         for (const name of labels) {
-            const label = [...document.querySelectorAll('*')].find(el =>
-                el.children.length === 0 &&
-                el.textContent.trim() === name &&
-                el.getBoundingClientRect().top < 220);
-            out[name] = label ? (label.previousElementSibling?.textContent.trim() ?? null) : null;
+            const xp = document.evaluate(
+                "//*[normalize-space(text())='" + name + "']",
+                document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null
+            );
+            let found = false;
+            for (let i = 0; i < xp.snapshotLength; i++) {
+                const label = xp.snapshotItem(i);
+                let ancestor = label.parentElement;
+                for (let d = 0; d < 4 && ancestor; d++, ancestor = ancestor.parentElement) {
+                    const numEl = [...ancestor.children].find(
+                        c => /^\\d+$/.test((c.innerText || c.textContent || '').trim())
+                    );
+                    if (numEl) {
+                        out[name] = (numEl.innerText || numEl.textContent).trim();
+                        found = true;
+                        break;
+                    }
+                }
+                if (found) break;
+            }
+            if (!found) out[name] = null;
         }
         return out;
     }"""
@@ -112,13 +133,37 @@ def ler_status(page) -> dict:
 def filtrar_approved(page):
     """
     Clica no card 'Approved' do topo para filtrar a tabela.
+    Usa JS para identificar o card correto (irmao numerico), evitando
+    clicar no 'Approved' do dropdown DR Status do formulario.
     """
     print("[2] Filtrando por status Approved ...")
-    card = page.locator(
-        "xpath=//*[normalize-space(text())='Approved']/.."
-    ).first
-    card.click()
+    found = page.evaluate("""() => {
+        const xp = document.evaluate(
+            "//*[normalize-space(text())='Approved']",
+            document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null
+        );
+        for (let i = 0; i < xp.snapshotLength; i++) {
+            const label = xp.snapshotItem(i);
+            let ancestor = label.parentElement;
+            for (let d = 0; d < 4 && ancestor; d++, ancestor = ancestor.parentElement) {
+                const numEl = [...ancestor.children].find(
+                    c => /^\\d+$/.test((c.innerText || c.textContent || '').trim())
+                );
+                if (numEl) {
+                    ancestor.click();
+                    return true;
+                }
+            }
+        }
+        return false;
+    }""")
+    if not found:
+        raise RuntimeError("Card 'Approved' nao encontrado na barra de status.")
     page.wait_for_load_state("networkidle")
+    try:
+        page.locator('[role="grid"]').wait_for(state='visible', timeout=10000)
+    except Exception:
+        pass  # 0 POs aprovadas — grid nao renderiza
     print("[2] Filtro aplicado.")
 
 
@@ -248,7 +293,7 @@ def voltar_para_lista(page):
         dr_list.click()
     else:
         page.go_back()
-    page.wait_for_load_state("networkidle")
+    page.locator('[role="grid"]').wait_for(state='visible')
 
 
 def processar_todas_pos(page) -> list:
