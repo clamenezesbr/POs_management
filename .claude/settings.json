@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(try { $r = Invoke-WebRequest -Uri \"http://localhost:9222/json\" -TimeoutSec 3 -ErrorAction Stop; Write-Output \"CDP disponivel\"; $r.Content | ConvertFrom-Json | Select-Object -First 2 | Format-List } catch { Write-Output \"CDP INDISPONIVEL: $_\" })",
+      "PowerShell(pip install playwright)",
+      "PowerShell($env:PATH += \";C:\\\\Users\\\\g50046371\\\\AppData\\\\Local\\\\Python\\\\pythoncore-3.14-64\\\\Scripts\"; playwright install chromium)"
+    ]
+  }
+}

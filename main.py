@@ -1,30 +1,24 @@
 """
 ================================================================================
- AUTOMACAO eplus.huawei.com - Partner Deal Registration  (PARTE 1)
+ AUTOMACAO eplus.huawei.com - Partner Deal Registration
 ================================================================================
- Cobre os blocos 1 a 4: buscar parceiro, filtrar Approved, coletar e abrir
- cada PO. A extracao detalhada dos campos (Parte 2) e a IA (bloco 5) ficam
- como TODO ate validarmos os seletores da tela de detalhe.
-
  LOGIN: este script NAO faz login. Abra o Chrome em modo debug, conecte a VPN
  e faca o SSO manualmente; o Playwright se pluga nessa sessao.
-   chrome.exe --remote-debugging-port=9222 --user-data-dir="C:\\eplus_profile"
+
+ PASSO A PASSO:
+   1. Execute launch_chrome.bat  (abre o Chrome com debug port)
+   2. Conecte a VPN
+   3. Faca o SSO manualmente no Chrome aberto
+   4. Execute rodar.bat (ou: python main.py)
+   5. Digite o nome do parceiro quando solicitado
 
  DEPENDENCIAS:
    pip install playwright
    playwright install chromium
-
- ----------------------------------------------------------------------------
- NOTAS DE ARQUITETURA (a partir dos seletores reais inspecionados):
-  - Botoes: localizados por TEXTO (nao ha classe unica confiavel).
-  - Campos: NAO ha label ligado por for/id -> ancoramos pelo texto do rotulo
-    e descemos para o input vizinho.
-  - Tabela: e um GRID VIRTUAL do Vue (role="grid"), NAO uma <table>.
-  - Links das POs: NAO sao <a href>. Sao spans com click do Vue Router.
-    => Nao da para coletar URLs. Abrimos por INDICE de linha e, apos voltar,
-       RECAPTURAMOS a tabela (os elementos antigos ficam "stale").
- ----------------------------------------------------------------------------
+================================================================================
 """
+
+import re
 
 from playwright.sync_api import sync_playwright, expect
 
@@ -37,13 +31,22 @@ TIMEOUT = 30000  # 30s - o site e lento
 # BLOCO 0 - Conectar a sessao ja logada
 # =============================================================================
 def conectar_navegador(playwright):
-    browser = playwright.chromium.connect_over_cdp(CDP_ENDPOINT)
+    print(f"[0] Conectando ao Chrome em {CDP_ENDPOINT} ...")
+    try:
+        browser = playwright.chromium.connect_over_cdp(CDP_ENDPOINT)
+    except Exception as e:
+        raise SystemExit(
+            f"\n[ERRO] Nao foi possivel conectar ao Chrome.\n"
+            f"  Verifique se o launch_chrome.bat foi executado antes da VPN.\n"
+            f"  Detalhe: {e}"
+        )
     context = browser.contexts[0]
     page = context.pages[0] if context.pages else context.new_page()
     page.set_default_timeout(TIMEOUT)
-    # Garante que estamos na listagem (se a SPA ja estiver aberta, nao recarrega a toa)
     if "deal_registration_list" not in page.url:
+        print("[0] Navegando para a listagem de Deal Registrations ...")
         page.goto(BASE_URL)
+    print("[0] Conectado com sucesso.")
     return browser, page
 
 
@@ -65,19 +68,18 @@ def _campo_por_rotulo(page, texto_rotulo: str):
 # BLOCO 1 - Buscar parceiro
 # =============================================================================
 def buscar_parceiro(page, nome_parceiro: str):
-    # Abre o painel "Advanced Search" (se ainda nao estiver aberto)
+    print(f"[1] Buscando parceiro: '{nome_parceiro}' ...")
     adv = page.get_by_role("button", name="Advanced Search")
     if adv.count() > 0 and adv.is_visible():
         adv.click()
 
-    # Preenche o campo "Partner Company" (ancorado pelo rotulo)
     campo = _campo_por_rotulo(page, "Partner Company")
     campo.click()
     campo.fill(nome_parceiro)
 
-    # Dispara a busca
     page.get_by_role("button", name="Query").click()
     page.wait_for_load_state("networkidle")
+    print("[1] Busca concluida.")
 
 
 # =============================================================================
@@ -109,14 +111,15 @@ def ler_status(page) -> dict:
 
 def filtrar_approved(page):
     """
-    Clica no card 'Approved' do topo (o agente confirmou que isso filtra a
-    tabela). Usamos o rotulo de texto e clicamos no elemento pai (o card).
+    Clica no card 'Approved' do topo para filtrar a tabela.
     """
+    print("[2] Filtrando por status Approved ...")
     card = page.locator(
         "xpath=//*[normalize-space(text())='Approved']/.."
     ).first
     card.click()
     page.wait_for_load_state("networkidle")
+    print("[2] Filtro aplicado.")
 
 
 # =============================================================================
@@ -151,20 +154,90 @@ def abrir_po_por_indice(page, idx_linha: int, idx_col_projeto: int):
     ).nth(idx_linha)
     celula = linha.locator('[role="gridcell"]').nth(idx_col_projeto)
     celula.locator('span, a').first.click()
-    page.wait_for_load_state("networkidle")
-    # TODO (Parte 2): trocar por expect(seletor da tela DR Details).to_be_visible()
+    # Aguarda o container da tela DR Details aparecer (mais confiavel que networkidle)
+    page.locator('#aui-collapse-content-54912283').wait_for(state='visible')
+
+
+# --- helpers para extrair contato do owner a partir do Project Background -----
+
+def _extrair_email(texto: str) -> str | None:
+    m = re.search(r'[\w.+-]+@[\w-]+\.[a-z]{2,}', texto, re.IGNORECASE)
+    return m.group() if m else None
+
+
+def _extrair_telefone(texto: str) -> str | None:
+    # Formatos brasileiros: (11) 99999-9999 | +55 11 99999-9999 | 11999999999
+    m = re.search(r'(?:\+?\d{1,3}[\s-]?)?(?:\(?\d{2}\)?[\s-]?)[\d\s-]{8,10}', texto)
+    if not m:
+        return None
+    candidato = m.group().strip()
+    # Descarta se for CNPJ (14 digitos sem formatacao de telefone)
+    apenas_digitos = re.sub(r'\D', '', candidato)
+    if len(apenas_digitos) == 14:
+        return None
+    return candidato if len(apenas_digitos) >= 8 else None
+
+
+def _extrair_nome_owner(texto: str) -> str | None:
+    # Procura linha com padrao "Gerente|Contato|Responsavel|Owner: <nome>"
+    # onde o nome vem antes do email/telefone
+    patterns = [
+        r'(?:Gerente|Contato|Responsável|Owner|Representante)[^:\n]*:\s*([^@\n\(]+)',
+        r'Nome[^:\n]*:\s*([^\n@]+)',
+    ]
+    for pat in patterns:
+        m = re.search(pat, texto, re.IGNORECASE)
+        if m:
+            nome = m.group(1).strip().rstrip(',;/ ')
+            # Rejeita se nao tiver espaco: provavelmente e um username, nao um nome real
+            if nome and ' ' in nome:
+                return nome
+    return None
 
 
 def extrair_dados_po(page) -> dict:
-    """[PARTE 2 - a preencher com os seletores da tela DR Details]"""
-    dados = {
-        "project_name": None, "dr_no": None, "submitted_partner": None,
-        "submitted_by": None, "submitted_date": None, "approval_date": None,
-        "estimated_order_date": None, "estimated_amount": None, "approver": None,
-        "expired_date": None, "public_tender": None, "project_background": None,
-        "owner_nome": None, "owner_email": None, "owner_telefone": None,
-    }
-    # TODO (Parte 2)
+    """Extrai todos os campos da tela DR Details via JS no container #aui-collapse-content-54912283."""
+    js = r"""() => {
+        const C = document.querySelector('#aui-collapse-content-54912283');
+        if (!C) return null;
+        const children = Array.from(C.children);
+
+        function getField(labelText) {
+            const label = children.find(el => el.innerText.trim() === labelText);
+            return label ? (label.nextElementSibling?.innerText.trim() ?? null) : null;
+        }
+
+        // Project Background: texto livre em varios nos apos o rotulo
+        function getBackground() {
+            const idx = children.findIndex(el => el.innerText.trim() === 'Project Background');
+            if (idx === -1) return null;
+            return children.slice(idx + 1)
+                .map(n => n.innerText.trim())
+                .filter(Boolean)
+                .join('\n');
+        }
+
+        return {
+            project_name:          getField('Project Name'),
+            dr_no:                 getField('DR. No.'),
+            submitted_partner:     getField('Submitted Partner'),
+            submitted_by:          getField('Submitted by'),
+            submitted_date:        getField('Submited Date'),
+            approval_date:         getField('Approval Date'),
+            estimated_order_date:  getField('Estimated Order Date'),
+            estimated_amount:      getField('Estimated Amount'),
+            approver:              getField('Approver'),
+            expired_date:          getField('Expired Date'),
+            public_tender:         getField('Public Tender'),
+            project_background:    getBackground(),
+        };
+    }"""
+
+    dados = page.evaluate(js) or {}
+    bg = dados.get("project_background") or ""
+    dados["owner_email"] = _extrair_email(bg)
+    dados["owner_telefone"] = _extrair_telefone(bg)
+    dados["owner_nome"] = _extrair_nome_owner(bg)
     return dados
 
 
@@ -183,10 +256,19 @@ def processar_todas_pos(page) -> list:
     resultados = []
     idx_col = _indice_coluna(page, "Project Name")
     total = contar_linhas(page)
+    print(f"[4] Processando {total} PO(s) aprovada(s) ...")
     for i in range(total):
-        abrir_po_por_indice(page, i, idx_col)
-        resultados.append(extrair_dados_po(page))
-        voltar_para_lista(page)
+        print(f"[4] PO {i + 1}/{total} ...")
+        try:
+            abrir_po_por_indice(page, i, idx_col)
+            dados = extrair_dados_po(page)
+            resultados.append(dados)
+            print(f"    DR No: {dados.get('dr_no')} | Projeto: {dados.get('project_name')}")
+        except Exception as e:
+            print(f"    [AVISO] Falha ao processar PO {i + 1}: {e}")
+            resultados.append({"erro": str(e), "indice": i})
+        finally:
+            voltar_para_lista(page)
     return resultados
 
 
@@ -198,7 +280,37 @@ def gerar_resumo_ia(dados_po: dict) -> str:
 
 
 def gerar_saida(resultados: list, nome_parceiro: str):
-    pass  # TODO: PDF / dashboard
+    """Imprime os dados extraidos no console. PDF / dashboard: fase futura."""
+    separador = "=" * 72
+    print(f"\n{separador}")
+    print(f"  RESULTADO — {nome_parceiro}  ({len(resultados)} PO(s) aprovada(s))")
+    print(separador)
+    for i, d in enumerate(resultados, 1):
+        if "erro" in d:
+            print(f"\n[PO {i}] ERRO: {d['erro']}")
+            continue
+        print(f"\n[PO {i}] {d.get('dr_no', 'N/A')}")
+        print(f"  Projeto:          {d.get('project_name')}")
+        print(f"  Parceiro:         {d.get('submitted_partner')}")
+        print(f"  Submetido por:    {d.get('submitted_by')}")
+        print(f"  Data submissao:   {d.get('submitted_date')}")
+        print(f"  Aprovado em:      {d.get('approval_date')}")
+        print(f"  Expira em:        {d.get('expired_date')}")
+        print(f"  Valor estimado:   {d.get('estimated_amount')}")
+        print(f"  Data pedido est.: {d.get('estimated_order_date')}")
+        print(f"  Aprovador:        {d.get('approver')}")
+        print(f"  Licitacao publ.:  {d.get('public_tender')}")
+        print(f"  --- Contato owner ---")
+        print(f"  Nome:             {d.get('owner_nome')}")
+        print(f"  Email:            {d.get('owner_email')}")
+        print(f"  Telefone:         {d.get('owner_telefone')}")
+        bg = d.get("project_background") or ""
+        if bg:
+            print(f"  --- Project Background ---")
+            for linha in bg.splitlines():
+                print(f"    {linha}")
+        print(f"  Resumo IA:        {d.get('resumo')}")
+    print(f"\n{separador}\n")
 
 
 # =============================================================================
@@ -209,9 +321,14 @@ def main(nome_parceiro: str):
         browser, page = conectar_navegador(p)
         try:
             buscar_parceiro(page, nome_parceiro)
-            print("Contadores:", ler_status(page))
+            contadores = ler_status(page)
+            print(f"[2] Contadores de status: {contadores}")
             filtrar_approved(page)
-            print(f"{contar_linhas(page)} POs aprovadas encontradas.")
+            total = contar_linhas(page)
+            print(f"[3] {total} PO(s) aprovada(s) encontrada(s).")
+            if total == 0:
+                print("Nenhuma PO aprovada para este parceiro. Encerrando.")
+                return
             resultados = processar_todas_pos(page)
             for d in resultados:
                 d["resumo"] = gerar_resumo_ia(d)
@@ -222,4 +339,6 @@ def main(nome_parceiro: str):
 
 if __name__ == "__main__":
     parceiro = input("Nome do parceiro: ").strip()
+    if not parceiro:
+        raise SystemExit("[ERRO] Nome do parceiro nao pode ser vazio.")
     main(parceiro)

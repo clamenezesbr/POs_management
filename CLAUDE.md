@@ -1,5 +1,7 @@
 # Projeto: Automação eplus.huawei.com — Partner Deal Registration
 
+> **REGRA:** Atualizar este arquivo a cada alteração no código.
+
 ## Objetivo
 Automatizar um processo manual feito várias vezes ao dia: dado o nome de um
 parceiro, buscar suas POs (Deal Registrations), filtrar as **Approved**, abrir
@@ -12,19 +14,30 @@ principalmente, o **contato do owner do parceiro**.
 - **Login NÃO é automatizado.** O usuário abre o Chrome em modo debug, conecta a
   VPN e faz o SSO manualmente. O script se PLUGA nessa sessão já logada via
   `connect_over_cdp` em `http://localhost:9222`.
-  - Comando para abrir o Chrome (Windows):
-    `chrome.exe --remote-debugging-port=9222 --user-data-dir="C:\eplus_profile"`
+  - Usar `launch_chrome.bat` (já criado) para abrir o Chrome com os flags certos.
   - O browser NUNCA é fechado pelo script (é a janela logada do usuário).
 - Site é lento → timeout padrão de 30s.
+- Dependências: `pip install playwright` + `playwright install chromium` (já feito).
 
-## Fluxo (6 blocos)
-0. Conectar à sessão já logada (CDP)
-1. Buscar parceiro (Advanced Search → Partner Company → Query)
-2. Ler contadores de status + filtrar Approved
-3. Contar/coletar as POs aprovadas
-4. Abrir e ler cada PO (uma por vez, mesma aba)
-5. IA: resumo + contato do owner — **PLACEHOLDER, fase futura**
-6. Saída: PDF primeiro, dashboard como evolução
+## Arquivos do projeto
+| Arquivo | Descrição |
+|---|---|
+| `main.py` | Script principal — blocos 0 a 6 |
+| `launch_chrome.bat` | Abre o Chrome com `--remote-debugging-port=9222` |
+| `rodar.bat` | Executa `python main.py` com mensagem de pré-requisitos |
+| `requirements.txt` | `playwright>=1.60.0` |
+
+## Fluxo (6 blocos) — estado atual
+| Bloco | Descrição | Status |
+|---|---|---|
+| 0 | Conectar à sessão CDP | ✅ Implementado |
+| 1 | Buscar parceiro (Advanced Search → Partner Company → Query) | ✅ Implementado |
+| 2 | Ler contadores de status + filtrar Approved | ✅ Implementado |
+| 3 | Contar POs aprovadas (grid virtual Vue) | ✅ Implementado |
+| 4 | Abrir e ler cada PO por índice | ✅ Implementado |
+| 4b | Extrair campos da tela DR Details (`extrair_dados_po`) | ✅ Implementado |
+| 5 | IA: resumo + contato do owner | 🔲 Placeholder |
+| 6 | Saída: PDF / dashboard | 🔲 Console por enquanto |
 
 ## Descobertas CRÍTICAS sobre o site (de inspeção real do DOM)
 O site usa framework **AUI / Element-UI (Vue)**. Implicações:
@@ -43,28 +56,57 @@ O site usa framework **AUI / Element-UI (Vue)**. Implicações:
     cada volta (elementos antigos ficam "stale").
 - Clicar no card "Approved" do topo filtra a tabela.
 
-## Estado atual
-- `eplus_automation.py` tem os **blocos 1 a 4 preenchidos** e compilando.
-- A **extração da tela de detalhe (Parte 2)** ainda é TODO — depende dos
-  seletores do "DR Details" (a inspecionar com o agente de navegador).
-- Bloco 5 (IA) e bloco 6 (saída) são placeholders.
+## Tela DR Details — estrutura do DOM (inspecionada)
+Container raiz: `#aui-collapse-content-54912283` (tabpanel "Basic Information").
 
-## Campos a extrair na tela DR Details (Parte 2)
-Project Name, DR No, Submitted Partner, Submitted by, Submitted Date,
-Approval Date, Estimated Order Date, Estimated Amount, Approver, Expired Date,
-Public Tender, e **Project Background** (texto livre com CNPJ, contato do owner,
-escopo, concorrente, orçamento — é daqui que a IA vai extrair o contato).
-Suspeita: os campos são pares rótulo+valor com padrão consistente → extrair
-todos de uma vez pelo padrão, em vez de um seletor por campo.
+Padrão flat/linear: filhos diretos alternando rótulo → valor.
+Extração via JS com `nextElementSibling` por texto do rótulo — robusto a
+mudanças de ordem. Project Background é multi-nó (vários `<div>` irmãos após
+o rótulo — capturar todos com `slice(bgLabelIdx + 1)`).
 
-## TODOs imediatos
-1. Testar a Parte 1 no site real (buscar, filtrar, contar).
-2. Confirmar `voltar_para_lista()`: botão "DR List" vs `go_back()`.
-3. Trocar o `wait_for_load_state` pós-abertura por esperar um seletor real do
-   DR Details.
-4. Rodar prompt da Parte 2 no agente de navegador para obter os seletores do
-   detalhe e preencher `extrair_dados_po()`.
+Campos mapeados: Project Name, DR No, Submitted Partner, Submitted by,
+Submited Date (typo do sistema, um "t"), Approval Date, Estimated Order Date,
+Estimated Amount, Approver, Expired Date, Public Tender, Project Background.
+
+## ⚠️ Risco conhecido: ID dinâmico do container
+`#aui-collapse-content-54912283` — o número `54912283` pode ser gerado
+dinamicamente pelo Vue e **mudar entre sessões ou deploys do site**.
+
+**Sintoma se quebrar:** `extrair_dados_po()` retorna todos os campos `None`.
+
+**Como corrigir:** trocar o seletor por algo estável, ex:
+```python
+# Opção A: prefixo do id
+page.locator('[id^="aui-collapse-content-"]').first
+
+# Opção B: pelo tab ativo "Basic Information"
+page.locator('[role="tabpanel"][aria-hidden="false"]')
+```
+Testar no site real e ajustar conforme necessário.
+
+## Extração de contato do owner (Project Background)
+O campo `project_background` é texto livre. Helpers de regex em `main.py`:
+- `_extrair_email()` — regex padrão de email
+- `_extrair_telefone()` — formatos BR; descarta CNPJ (14 dígitos)
+- `_extrair_nome_owner()` — busca "Gerente|Contato|Responsável|Owner: <nome>"
+  só aceita se tiver espaço no valor (filtra usernames de email)
+
+Exemplo real observado:
+```
+"Gerente de Negócios (Cel/E-mail): jonatasmsouza@nereidas.com.br"
+→ owner_email: "jonatasmsouza@nereidas.com.br"
+→ owner_nome:  None  (sem nome explícito na linha)
+```
+
+## TODOs restantes
+1. **Testar no site real** — validar blocos 1-4b com um parceiro real.
+2. **Confirmar ID do container** `#aui-collapse-content-54912283` é estável;
+   se não for, aplicar a correção acima.
+3. **Confirmar `voltar_para_lista()`** — botão "DR List" vs `go_back()`.
+4. **Bloco 5 (IA)** — integrar LLM para resumo + extração de contato do Background.
+5. **Bloco 6 (saída)** — gerar PDF com os dados.
 
 ## Preferências do usuário (Gabriel)
 - Respostas objetivas e diretas.
 - Estrutura modular, código comentado quando pedir.
+- Atualizar CLAUDE.md a cada alteração no código.
